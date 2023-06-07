@@ -1,18 +1,3 @@
-""" Copyright (C) 2021 Pony Preservation Project
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Affero General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    You should have received a copy of the GNU Affero General Public License
-    along with this program.  If not, see <https://www.gnu.org/licenses/>."""
-
 import json
 import os
 import re
@@ -28,16 +13,13 @@ import psola
 import crepe
 import io
 import base64
-import tensorflow_hub as hub
-import tensorflow as tf
-import scipy
-import resampy
 import torchcrepe
 from scipy.signal import savgol_filter
-
+import torch
+import numpy as np
+import librosa
 
 USE_SPICE = False  # Better than CREPE in some cases, but a lot worse with noisy audio
-
 
 class ExtractDuration:
     VOICED = (
@@ -81,7 +63,7 @@ class ExtractDuration:
         )
         self.run_path = run_path
         self.arpadict = self._load_dictionary(
-            os.path.join(run_path, "horsewords.clean")
+            os.path.join(run_path, "assets/words.txr")
         )
         self.parser = AudioToCharWithDursF0Dataset.make_vocab(
             notation="phonemes",
@@ -327,69 +309,18 @@ class ExtractPitch:
         )
 
     def _spice_f0(self, wav_path, hop_length=256):
-        if self.spice is None:
-            self.spice = hub.load("https://tfhub.dev/google/spice/2")
-
-        def output2hz(pitch_output):
-            # Constants taken from https://tfhub.dev/google/spice/2
-            PT_OFFSET = 25.58
-            PT_SLOPE = 63.07
-            FMIN = 10.0
-            BINS_PER_OCTAVE = 12.0
-            cqt_bin = pitch_output * PT_SLOPE + PT_OFFSET
-            return FMIN * 2.0 ** (1.0 * cqt_bin / BINS_PER_OCTAVE)
-
-        # Resampling
         sr, audio = wavfile.read(wav_path)
-        audio_x = np.arange(0, len(audio)) / 22050.0
-        wave = resampy.resample(
-            audio,
-            sr,
-            16000,
-            filter="sinc_window",
-            window=scipy.signal.windows.hann,
-            num_zeros=8,
-        ).astype(np.float32)
-
-        # Prediction
-        output = self.spice.signatures["serving_default"](tf.constant(wave))
-        frequency = [output2hz(p) for p in output["pitch"]]
-        confidence = 1.0 - output["uncertainty"]
-
-        # Interpolation
-        x = np.arange(0, len(audio), hop_length) / 22050.0
-        xp = np.arange(0, len(frequency)) * 0.032
-        xp_threshold = []
-        fp_threshold = []
-        conf_threshold = 0.25
-        for i in range(len(xp)):
-            if confidence[i] >= conf_threshold:
-                xp_threshold.append(xp[i])
-                fp_threshold.append(frequency[i])
-        freq_zeroes = np.interp(x, xp, frequency)
-        freq_threshold = np.interp(x, xp_threshold, fp_threshold)
-        conf_interp = np.interp(x, xp, confidence)
-        audio_interp = np.interp(x, audio_x, np.absolute(audio)) / 32768.0
-        weights = [0.5, 0.25, 0.25]
-        audio_smooth = np.convolve(audio_interp, np.array(weights)[::-1], "same")
-
-        audio_threshold = 0.0005
-        for i in range(len(freq_zeroes)):
-            if conf_interp[i] < conf_threshold:
-                freq_zeroes[i] = 0.0
-            if audio_smooth[i] < audio_threshold:
-                freq_zeroes[i] = 0.0
-
-        # Hack to make f0 and mel lengths equal
-        if len(audio) % hop_length == 0:
-            freq_zeroes = np.pad(freq_zeroes, pad_width=[0, 1])
-            freq_threshold = np.pad(freq_threshold, pad_width=[0, 1])
-            conf_interp = np.pad(conf_interp, pad_width=[0, 1])
+        # apply YIN
+        pitches, harmonic_rates, argmins, times = librosa.core.yin(audio, fmin=10, fmax=sr/2)
+        # apply threshold to harmonic_rates (corresponding to uncertainty)
+        pitches[harmonic_rates > 0.25] = 0.0
+        # reshape pitches to have the same shape as the input audio
+        pitches = pitches[:audio.shape[0]//hop_length+1]
 
         return (
-            torch.from_numpy(freq_zeroes.astype(np.float32)),
-            torch.from_numpy(freq_threshold.astype(np.float32)),
-            torch.from_numpy(conf_interp.astype(np.float32)),
+            torch.from_numpy(pitches.astype(np.float32)),
+            torch.from_numpy(pitches.astype(np.float32)),  # using pitches also as frequency threshold as there's no equivalent in YIN
+            torch.from_numpy((1-harmonic_rates).astype(np.float32))  # using (1-harmonic_rate) as the confidence
         )
 
     def _torchcrepe_f0(self, wav_path, hop_length=256):

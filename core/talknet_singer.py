@@ -2,7 +2,6 @@ from collections import OrderedDict
 from typing import List
 
 import torch
-from hydra.utils import instantiate
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from torch import nn
@@ -40,14 +39,18 @@ class TalkNetSingerModel(SpectrogramGenerator, Exportable):
             **cfg.train_ds.dataset.vocab
         )
         self.blanking = cfg.train_ds.dataset.blanking
-        self.preprocessor = instantiate(cfg.preprocessor)
+
+        # Assuming `cfg.preprocessor` has class and params attributes
+        self.preprocessor = cfg.preprocessor.class(**cfg.preprocessor.params)
+
         self.embed = GaussianEmbedding(self.vocab, cfg.d_char)
         self.norm_f0 = MaskedInstanceNorm1d(1)
         self.res_f0 = StyleResidual(cfg.d_char, 1, kernel_size=3)
-        self.model = instantiate(cfg.model)
+
+        # Assuming `cfg.model` has class and params attributes
+        self.model = cfg.model.class(**cfg.model.params)
         d_out = cfg.model.jasper[-1].filters
         self.proj = nn.Conv1d(d_out, cfg.n_mels, kernel_size=1)
-
     def forward(self, text, text_len, durs, f0):
         x, x_len = self.embed(text, durs).transpose(1, 2), durs.sum(-1)
         f0_sin = np.nan_to_num(np.sin(9.06472 * np.log(0.0363636 * f0.cpu())))
